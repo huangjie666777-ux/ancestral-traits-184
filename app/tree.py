@@ -5,6 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def quote_name(name: str) -> str:
+    """Quote a Newick label so commas, parentheses, quotes and braces survive."""
+    plain = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                "0123456789_.-")
+    if name and all(ch in plain for ch in name):
+        return name
+    return "'" + name.replace("'", "''") + "'"
+
+
 @dataclass
 class Edge:
     u: int          # parent-side node (orientation used for distal_length)
@@ -111,7 +120,7 @@ def orient_and_serialize(g: TreeGraph) -> str:
 
     def fmt(node: int) -> str:
         if node in g.leaf_name:
-            return g.leaf_name[node]
+            return quote_name(g.leaf_name[node])
         parts = []
         for v, eid in list(g.adj[node]):
             if v in visited:
@@ -124,3 +133,147 @@ def orient_and_serialize(g: TreeGraph) -> str:
 
     body = fmt(root)
     return body + ";"
+
+
+@dataclass
+class _NT:
+    children: list
+    name: str | None
+    length: float | None
+    edge_num: int | None
+
+
+class _Tok:
+    def __init__(self, text: str) -> None:
+        self.s = text.strip()
+        if self.s.endswith(";"):
+            self.s = self.s[:-1]
+        self.i = 0
+
+    def skip_ws(self) -> None:
+        while self.i < len(self.s) and self.s[self.i].isspace():
+            self.i += 1
+
+    def label(self) -> str:
+        self.skip_ws()
+        if self.i >= len(self.s) or self.s[self.i] != "'":
+            start = self.i
+            while self.i < len(self.s) and self.s[self.i] not in ",:;()[]{}":
+                self.i += 1
+            return self.s[start:self.i].strip()
+        self.i += 1
+        out: list[str] = []
+        while True:
+            if self.i >= len(self.s):
+                raise ValueError("unterminated quoted label")
+            ch = self.s[self.i]
+            if ch == "'":
+                if self.i + 1 < len(self.s) and self.s[self.i + 1] == "'":
+                    out.append("'")
+                    self.i += 2
+                else:
+                    self.i += 1
+                    return "".join(out)
+            else:
+                out.append(ch)
+                self.i += 1
+
+    def expect(self, ch: str) -> None:
+        self.skip_ws()
+        if self.i >= len(self.s) or self.s[self.i] != ch:
+            raise ValueError("expected '" + ch + "' at position " + str(self.i))
+        self.i += 1
+
+    def number(self) -> float:
+        self.skip_ws()
+        start = self.i
+        while self.i < len(self.s) and (self.s[self.i].isdigit()
+                                        or self.s[self.i] in ".eE+-"):
+            self.i += 1
+        token = self.s[start:self.i].strip()
+        if not token:
+            raise ValueError("missing number at position " + str(start))
+        return float(token)
+
+    def integer(self) -> int:
+        self.skip_ws()
+        start = self.i
+        while self.i < len(self.s) and self.s[self.i].isdigit():
+            self.i += 1
+        token = self.s[start:self.i]
+        if not token:
+            raise ValueError("missing edge number at position " + str(start))
+        return int(token)
+
+    def branch(self) -> tuple[float | None, int | None]:
+        length = None
+        edge_num = None
+        self.skip_ws()
+        if self.i < len(self.s) and self.s[self.i] == ":":
+            self.i += 1
+            length = self.number()
+        self.skip_ws()
+        if self.i < len(self.s) and self.s[self.i] == "{":
+            self.i += 1
+            edge_num = self.integer()
+            self.expect("}")
+        return length, edge_num
+
+
+def parse_annotated_newick(text: str) -> dict:
+    """Parse jplace Newick (quoted labels, ':length{edge_num}') into geometry.
+
+    Returns {'lengths': {edge_num: length},
+             'subtree': {edge_num: (child_edges, leaf_name|None)},
+             'edge_order': [edge_num, ...]}.
+    Edges are oriented parent -> child; 'subtree' lists edges on the child
+    (distal) side, including the edge itself.
+    """
+    tok = _Tok(text)
+
+    def node() -> _NT:
+        tok.skip_ws()
+        children: list[_NT] = []
+        if tok.i < len(tok.s) and tok.s[tok.i] == "(":
+            tok.i += 1
+            while True:
+                children.append(node())
+                tok.skip_ws()
+                if tok.i < len(tok.s) and tok.s[tok.i] == ",":
+                    tok.i += 1
+                    continue
+                break
+            tok.expect(")")
+        name = tok.label() or None
+        length, edge_num = tok.branch()
+        return _NT(children, name, length, edge_num)
+
+    root = node()
+    tok.skip_ws()
+    if tok.i != len(tok.s):
+        raise ValueError("trailing characters at position " + str(tok.i))
+
+    lengths: dict[int, float] = {}
+    child_of: dict[int, list[int]] = {}
+    leaf_of: dict[int, str | None] = {}
+    edge_order: list[int] = []
+
+    def walk(nd: _NT) -> list[int]:
+        below: list[int] = []
+        for child in nd.children:
+            below.extend(walk(child))
+        if nd.edge_num is not None:
+            if nd.length is None:
+                raise ValueError("edge " + str(nd.edge_num) + " has no length")
+            if nd.edge_num in lengths:
+                raise ValueError("duplicate edge number " + str(nd.edge_num))
+            lengths[nd.edge_num] = float(nd.length)
+            child_of[nd.edge_num] = below
+            leaf_of[nd.edge_num] = nd.name if not nd.children else None
+            edge_order.append(nd.edge_num)
+            return below + [nd.edge_num]
+        return below
+
+    walk(root)
+    return {"lengths": lengths, "subtree": child_of,
+            "leaf": leaf_of, "edge_order": edge_order}

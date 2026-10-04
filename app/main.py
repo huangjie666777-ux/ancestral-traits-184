@@ -13,6 +13,8 @@ from pydantic import BaseModel
 from .jplacefmt import build_jplace
 from .likelihood import DirectedMessages, obs_vector
 from .placement import has_base_evidence, place_query
+from .community import (CommunityError, build_measures, distance_matrix,
+                        pair_distance, resolve_jobs, validate_request)
 from .tree import from_phylotree, orient_and_serialize, renumber_edges
 from .validation import (MAX_QUERIES, MAX_REFS, MIN_QUERIES, MIN_REFS,
                          SubmissionError, cross_validate, parse_tree,
@@ -102,3 +104,48 @@ def download_jplace(job_id: str):
         headers={"Content-Disposition":
                  "attachment; filename=placements_" + job_id + ".jplace"},
     )
+
+
+@app.post("/community/distances", status_code=200)
+def community_distances(payload: dict):
+    """KR (p=1) distances between 2..10 read-count samples on one reference.
+
+    Stored placement jobs are never modified or recomputed: placement mass is
+    derived from each job's existing jplace (all candidate edges weighted by
+    like_weight_ratio).  Any located problem (unknown job/query, illegal
+    count, mismatched reference tree, non-positive valid total) rejects the
+    whole batch with HTTP 422.
+    """
+    try:
+        samples = validate_request(payload)
+        jobs = resolve_jobs(samples, JOBS)
+        geo, measures, report = build_measures(samples, jobs)
+        matrix = distance_matrix(geo, measures)
+        n = len(samples)
+        pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                detail = pair_distance(geo, measures[i], measures[j])
+                contrib_sum = sum(detail["contributions"].values())
+                pairs.append({
+                    "i": i, "j": j,
+                    "sample_a": samples[i]["sample_id"],
+                    "sample_b": samples[j]["sample_id"],
+                    "distance": detail["distance"],
+                    "contributions_sum": contrib_sum,
+                    "edge_contributions": [
+                        {"edge_num": eid,
+                         "contribution": detail["contributions"][eid]}
+                        for eid in sorted(geo["lengths"])
+                    ],
+                })
+    except CommunityError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"rejected": True, "problem": str(exc)})
+    return {
+        "sample_ids": [s["sample_id"] for s in samples],
+        "tree": jobs[0]["jplace"]["tree"],
+        "matrix": matrix,
+        "pairs": pairs,
+        "samples": report,
+    }
