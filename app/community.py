@@ -113,6 +113,9 @@ def build_measures(samples: list[dict], jobs: list[dict]):
 
         for qid in sorted(counts):
             count = counts[qid]
+            if qid not in places and qid not in unplaceable:
+                raise CommunityError("sample '" + sample["sample_id"] + "': "
+                                     "unknown query id '" + qid + "'")
             if count == 0:
                 continue
             if qid in places:
@@ -139,12 +142,9 @@ def build_measures(samples: list[dict], jobs: list[dict]):
                     length = lengths[eid]
                     pos = min(max(length - c["distal_length"], 0.0), length)
                     raw_events[eid].append((pos, count * c["like_weight_ratio"]))
-            elif qid in unplaceable:
+            else:
                 excluded.append({"id": qid, "count": count,
                                  "reason": unplaceable[qid]})
-            else:
-                raise CommunityError("sample '" + sample["sample_id"] + "': "
-                                     "unknown query id '" + qid + "'")
 
         if valid_total <= 0:
             raise CommunityError("sample '" + sample["sample_id"] + "': no "
@@ -195,10 +195,8 @@ def pair_distance(geo: dict, m1: dict, m2: dict) -> dict:
     d1: dict[int, float] = {}
     d2: dict[int, float] = {}
     for eid in geo["edge_order"]:
-        child_total_1 = sum(d1.get(c, 0.0) for c in subtree[eid]
-                            if c != eid)
-        child_total_2 = sum(d2.get(c, 0.0) for c in subtree[eid]
-                            if c != eid)
+        child_total_1 = sum(d1.get(c, 0.0) for c in subtree[eid])
+        child_total_2 = sum(d2.get(c, 0.0) for c in subtree[eid])
         d1[eid] = child_total_1 + edge_total(m1, eid)
         d2[eid] = child_total_2 + edge_total(m2, eid)
 

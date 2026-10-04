@@ -15,6 +15,7 @@ from .likelihood import DirectedMessages, obs_vector
 from .placement import has_base_evidence, place_query
 from .community import (CommunityError, build_measures, distance_matrix,
                         pair_distance, resolve_jobs, validate_request)
+from .permanova import run_permanova
 from .tree import from_phylotree, orient_and_serialize, renumber_edges
 from .validation import (MAX_QUERIES, MAX_REFS, MIN_QUERIES, MIN_REFS,
                          SubmissionError, cross_validate, parse_tree,
@@ -149,3 +150,19 @@ def community_distances(payload: dict):
         "pairs": pairs,
         "samples": report,
     }
+
+
+@app.post("/community/permanova", status_code=200)
+def community_permanova(payload: dict):
+    """Batch-constrained PERMANOVA on KR distances between 4..10 samples.
+
+    Reuses stored jobs and the community KR matrix; only group labels are
+    permuted (within batches when given).  Illegal designs, degenerate
+    sums of squares and designs with no legal label exchange are located
+    and rejected with HTTP 422.
+    """
+    try:
+        return run_permanova(payload, JOBS)
+    except CommunityError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"rejected": True, "problem": str(exc)})

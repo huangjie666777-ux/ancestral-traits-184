@@ -54,6 +54,34 @@
 `contributions_sum` 等于该对 `distance`。`samples` 中保留每样本的
 `excluded` 排除清单与 `valid_total` 有效总数。
 
+## 批次约束 PERMANOVA（`POST /community/permanova`）
+
+实验人员可判断处理组间的群落组成差异是否超出随机分组水平。请求含
+4–10 个原格式样本（`sample_id`/`job_id`/`counts`），每样本附非空
+`group`；至少 2 组且每组至少 2 个样本。可选 `batch`：任一样本给出则
+全体必须给出非空批次。`permutations` 为 1–9999 的整数，`seed` 为整数；
+非法设计（样本数、组人数、批次缺失、置换数/种子类型越界）会被定位并
+整单拒绝（HTTP 422）。接口复用已有任务、全候选质量构造与 KR 矩阵，
+**不重算放置、不修改任务**。
+
+统计量（距离平方和分解）：
+- `ss_total` = 全部样本对距离平方和 / 样本数 n
+- `ss_within` = 各组内样本对距离平方和 / 组人数，跨组相加
+- `ss_between` = 两者之差；pseudo-F = (ss_between/(g-1)) / (ss_within/(n-g))
+- `R2` = ss_between / ss_total
+
+置换方案：只交换组别标签，距离矩阵与各组人数固定；有批次时仅在批次内
+均匀交换，保留各批次组别数量。若不存在任何能改变分组的合法交换（如
+每个批次内组别单一），明确拒绝，**不把跨批次混洗当作有效检验**。合法
+分配总数不超过请求的置换数时全部枚举（含原分组），p 值为 F 不小于观测
+值的比例；否则按 `seed` 随机抽取 `permutations` 次（允许重复），
+p = (极端次数 + 1)/(置换数 + 1)，同请求同种子完全复现。总平方和或组内
+平方和为 0 时明确拒绝。
+
+响应含样本顺序（`sample_ids`）、`groups`、`batches`、三个平方和、两个
+自由度、`F`、`R2`、`p_value`、`method`（`exact`/`random`）、实际次数
+`permutations` 及合法分配总数 `n_assignments`。
+
 ## 模块协作
 
 - `app/validation.py` — FASTA/Newick 解析与定位校验（整单拒绝）
@@ -62,8 +90,9 @@
 - `app/placement.py` — 逐枝优化（拆分点 + 新枝长）、权重归一化与排序
 - `app/jplacefmt.py` — jplace v3 文档组装（五个标准放置字段）
 - `app/community.py` — 样本校验、质量构造（全候选权重）与树上 KR(p=1) 距离
+- `app/permanova.py` — 批次约束的分组设计校验、平方和分解与精确/随机置换检验
 - `app/main.py` — FastAPI 入口：`POST /place`、`GET /place/{job_id}/jplace`、
-  `POST /community/distances`
+  `POST /community/distances`、`POST /community/permanova`
 
 ## 运行
 
@@ -80,7 +109,9 @@ PYTHONPATH=. .venv/bin/python scripts/selftest.py
 
 自测覆盖：示例放置、权重归一化、似然降序排序、jplace 下载结构、
 非法字符与 `U` 的定位拒绝、群落 KR 矩阵（对称性/对角/贡献和等于距离/
-相同组成距离为 0）、群落接口的各类整单拒绝、以及逗号叶名 Newick 解析往返。
+相同组成距离为 0）、深层树远端质量只累计一次、零计数未知 ID 拒绝、
+群落接口的各类整单拒绝、PERMANOVA 的精确/随机置换与全部非法设计拒绝、
+以及逗号叶名 Newick 解析往返。
 KR 积分另与 scipy 最小费用流线性规划在小树上交叉验证一致。
 
 ## curl 示例
@@ -111,6 +142,21 @@ curl -s -X POST http://127.0.0.1:8169/community/distances \
        "counts": {"q1": 8, "q3": 3}},
       {"sample_id": "site2", "job_id": "<job_id>",
        "counts": {"q1": 2, "q2": 6}}
+    ]}'
+
+# 批次约束 PERMANOVA：4 个样本、2 组、仅在批次内交换标签
+curl -s -X POST http://127.0.0.1:8169/community/permanova \
+  -H 'Content-Type: application/json' -d '{
+    "permutations": 999, "seed": 42,
+    "samples": [
+      {"sample_id": "s1", "job_id": "<job_id>", "group": "treat", "batch": "b1",
+       "counts": {"q1": 8, "q2": 1}},
+      {"sample_id": "s2", "job_id": "<job_id>", "group": "ctrl", "batch": "b1",
+       "counts": {"q1": 1, "q2": 8}},
+      {"sample_id": "s3", "job_id": "<job_id>", "group": "treat", "batch": "b2",
+       "counts": {"q1": 7, "q2": 2}},
+      {"sample_id": "s4", "job_id": "<job_id>", "group": "ctrl", "batch": "b2",
+       "counts": {"q1": 2, "q2": 7}}
     ]}'
 \`\`\`
 

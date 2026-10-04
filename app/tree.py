@@ -226,8 +226,9 @@ def parse_annotated_newick(text: str) -> dict:
     Returns {'lengths': {edge_num: length},
              'subtree': {edge_num: (child_edges, leaf_name|None)},
              'edge_order': [edge_num, ...]}.
-    Edges are oriented parent -> child; 'subtree' lists edges on the child
-    (distal) side, including the edge itself.
+    Edges are oriented parent -> child; 'subtree' lists the immediate
+    child edges on the distal side (not the edge itself, not deeper
+    descendants), so distal subtree mass can be accumulated exactly once.
     """
     tok = _Tok(text)
 
@@ -258,21 +259,19 @@ def parse_annotated_newick(text: str) -> dict:
     leaf_of: dict[int, str | None] = {}
     edge_order: list[int] = []
 
-    def walk(nd: _NT) -> list[int]:
-        below: list[int] = []
+    def walk(nd: _NT) -> None:
         for child in nd.children:
-            below.extend(walk(child))
+            walk(child)
         if nd.edge_num is not None:
             if nd.length is None:
                 raise ValueError("edge " + str(nd.edge_num) + " has no length")
             if nd.edge_num in lengths:
                 raise ValueError("duplicate edge number " + str(nd.edge_num))
             lengths[nd.edge_num] = float(nd.length)
-            child_of[nd.edge_num] = below
+            child_of[nd.edge_num] = [c.edge_num for c in nd.children
+                                     if c.edge_num is not None]
             leaf_of[nd.edge_num] = nd.name if not nd.children else None
             edge_order.append(nd.edge_num)
-            return below + [nd.edge_num]
-        return below
 
     walk(root)
     return {"lengths": lengths, "subtree": child_of,
