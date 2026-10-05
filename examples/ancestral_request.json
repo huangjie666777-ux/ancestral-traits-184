@@ -1,0 +1,16 @@
+{
+  "job_id": "<job_id>",
+  "states": ["sensitive", "tolerant"],
+  "outgroup_leaf_id": "refE",
+  "leaf_states": {
+    "refA": ["sensitive"],
+    "refB": ["sensitive", "tolerant"],
+    "refC": ["tolerant"],
+    "refD": ["tolerant"],
+    "refE": ["sensitive"]
+  },
+  "cost_matrix": [
+    [0, 1],
+    [1, 0]
+  ]
+}

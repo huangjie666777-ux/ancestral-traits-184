@@ -91,8 +91,45 @@ p = (极端次数 + 1)/(置换数 + 1)，同请求同种子完全复现。总平
 - `app/jplacefmt.py` — jplace v3 文档组装（五个标准放置字段）
 - `app/community.py` — 样本校验、质量构造（全候选权重）与树上 KR(p=1) 距离
 - `app/permanova.py` — 批次约束的分组设计校验、平方和分解与精确/随机置换检验
+- `app/ancstates.py` — 祖先性状重建：外群定向、Sankoff 动态规划、最优历史
+  精确计数与 reroot 双向消息求全局最优下的节点/枝状态可能性
 - `app/main.py` — FastAPI 入口：`POST /place`、`GET /place/{job_id}/jplace`、
-  `POST /community/distances`、`POST /community/permanova`
+  `POST /community/distances`、`POST /community/permanova`、
+  `POST /ancestral/states`
+
+## 祖先性状重建（`POST /ancestral/states`）
+
+研究人员可在**已有放置任务的参考树**上重建耐受性等离散性状。接口只读取任务
+存储的带枝号 Newick，**不修改任务、不重算放置**，保留全部叶与原枝号。
+
+请求字段：
+- `job_id`：已有放置任务；未知任务定位并整单拒绝（HTTP 422）。
+- `states`：2–5 个**唯一、非空**状态名，按声明顺序排列（重复状态名拒绝）。
+- `outgroup_leaf_id`：外群叶 ID；必须是参考树叶，树以外群叶**相邻的内部
+  节点**为根，外群柄枝即根 → 外群枝。
+- `leaf_states`：**每个参考叶恰好一次**的非空允许状态列表。叶必须与参考树
+  完整对应：多余叶、缺失叶、未知状态、叶内重复状态、非空性以及原始 JSON 中
+  **重复叶键**都会定位并整单拒绝。列表表示**不确定取值**（恰好为其中之一），
+  不是同时具有多态；未知性状请显式给出全部状态。
+- `cost_matrix`：按 `states` 顺序排列的方阵；元素为非负整数或 `null`
+  （`null` 禁止该方向的父→子转移），对角必须为 0；布尔、负数、小数拒绝。
+
+每枝按**父状态 → 子状态查一次代价**求和：不乘枝长，也不在一枝内串接中间
+状态。算法为带方向代价的 Sankoff（Fitch）动态规划：
+- 返回整树最小总代价 `minimum_cost` 与**所有**最优完整赋值（全部内部节点 +
+  全部叶赋值）的数量 `optimal_histories`；数量可能极大，用十进制**字符串**
+  表示，未知/歧义叶的不同赋值计入。
+- `nodes` 给出每个节点在**任一全局最优历史**中可能取的状态；叶附参考 ID
+  （`leaf_id`），内部节点以**相邻枝号集合**稳定标识（如
+  `internal:[0,1,6]`），并标明 `is_root` 与 `parent_node` 父子方向。
+- `edges` 对每条枝给出在**某个全局最优历史**中实际出现的有序
+  `[父状态, 子状态]` 对（由 reroot 双向消息精确求得，**不是**两端状态集合
+  的笛卡尔积，也不是任意一个最优解），并分类：`always_change`（必然变化）、
+  `possibly_change`（可能变化，即最优历史中有变也有不变）、`always_same`
+  （必然不变）。歧义只如实报告，**不冒充概率**。
+- 若叶约束在允许转移下无任何完整历史（如某个节点被迫进入无法同时满足各子
+  树的状态），返回 `{"feasible": false, "reasons": [...]}`，逐枝定位原因，
+  **不返回半套结果**。
 
 ## 运行
 
@@ -155,9 +192,14 @@ curl -s -X POST http://127.0.0.1:8169/community/permanova \
        "counts": {"q1": 1, "q2": 8}},
       {"sample_id": "s3", "job_id": "<job_id>", "group": "treat", "batch": "b2",
        "counts": {"q1": 7, "q2": 2}},
-      {"sample_id": "s4", "job_id": "<job_id>", "group": "ctrl", "batch": "b2",
-       "counts": {"q1": 2, "q2": 7}}
-    ]}'
+     {"sample_id": "s4", "job_id": "<job_id>", "group": "ctrl", "batch": "b2",
+      "counts": {"q1": 2, "q2": 7}}
+   ]}'
+
+# 祖先性状重建：引用已有任务（examples/ancestral_request.json 为模板）
+sed 's#<job_id>#<job_id>#' examples/ancestral_request.json \\
+  | curl -s -X POST http://127.0.0.1:8169/ancestral/states \\
+    -H 'Content-Type: application/json' --data-binary @-
 \`\`\`
 
 ## jplace 输出

@@ -293,6 +293,219 @@ def main() -> None:
         {"sample_id": "w3", "job_id": job_id,
          "counts": {"q1": 2, "q2": 8}, "group": "C"}],
         "permutations": 99, "seed": 1}, "within-group sum of squares is zero")
+    # ---- ancestral state reconstruction on the stored placement job ----
+    from app.ancstates import build_rooted_tree
+    import itertools
+
+    JOBS_TREE = {job_id: doc["tree"]}
+
+    def anc_body(states=("sensitive", "tolerant"), outgroup="refE",
+                 leaves=None, matrix=None, job=job_id):
+        if leaves is None:
+            leaves = {"refA": ["sensitive"], "refB": ["sensitive", "tolerant"],
+                      "refC": ["tolerant"], "refD": ["tolerant"],
+                      "refE": ["sensitive"]}
+        if matrix is None:
+            matrix = [[0, 1], [1, 0]]
+        return {"job_id": job, "states": list(states),
+                "outgroup_leaf_id": outgroup, "leaf_states": leaves,
+                "cost_matrix": matrix}
+
+    def brute_force(body):
+        """Enumerate every complete node assignment; independent cross-check."""
+        tree_text = JOBS_TREE[body["job_id"]]
+        nodes, root, endpoints, _ = build_rooted_tree(
+            tree_text, body["outgroup_leaf_id"])
+        states = body["states"]
+        k = len(states)
+        allowed = {n.leaf: [states.index(s) for s in vals]
+                   for n in nodes.values() if n.is_leaf
+                   for vals in [body["leaf_states"][n.leaf]]}
+        internal = [key for key, n in nodes.items() if not n.is_leaf]
+        leaf_nodes = [n for n in nodes.values() if n.is_leaf]
+        best, ways = float("inf"), 0
+        node_states_seen = {key: set() for key in nodes}
+        edge_pairs_seen = {e: set() for e in endpoints}
+        assignments = []
+        for combo in itertools.product(range(k), repeat=len(internal)):
+            assign = dict(zip(internal, combo))
+            leaf_opts = [allowed[n.leaf] for n in leaf_nodes]
+            for pick in itertools.product(*leaf_opts):
+                for n, pv in zip(leaf_nodes, pick):
+                    assign[n.key] = pv
+                tot = 0
+                good = True
+                for pkey, ckey in endpoints.values():
+                    c = body["cost_matrix"][assign[pkey]][assign[ckey]]
+                    if c is None:
+                        good = False
+                        break
+                    tot += c
+                if good:
+                    assignments.append((tot, dict(assign)))
+                    if tot < best:
+                        best, ways = tot, 1
+                    elif tot == best:
+                        ways += 1
+        for tot, assign in assignments:
+            if tot != best:
+                continue
+            for key in nodes:
+                node_states_seen[key].add(assign[key])
+            for e, (pkey, ckey) in endpoints.items():
+                edge_pairs_seen[e].add((assign[pkey], assign[ckey]))
+        return best, ways, node_states_seen, edge_pairs_seen
+
+    body0 = anc_body()
+    resp = client.post("/ancestral/states", json=body0)
+    assert resp.status_code == 200, resp.text
+    anc = resp.json()
+    assert anc["feasible"] is True
+    bf_cost, bf_ways, ns_seen, ep_seen = brute_force(body0)
+    assert anc["minimum_cost"] == bf_cost, (anc["minimum_cost"], bf_cost)
+    assert anc["optimal_histories"] == str(bf_ways), \
+        (anc["optimal_histories"], bf_ways)
+    assert sum(1 for nr in anc["nodes"] if nr["kind"] == "leaf") == 5
+    assert sum(1 for nr in anc["nodes"] if nr["kind"] == "internal") == 3
+    roots = [nr for nr in anc["nodes"] if nr["is_root"]]
+    assert len(roots) == 1 and anc["root_node"] == roots[0]["node_id"]
+    assert len(anc["edges"]) == 7
+
+    tree0 = doc["tree"]
+    nodes0, root0, ep0, _ = build_rooted_tree(tree0, "refE")
+    labels = {key: ("leaf:" + n.leaf) if n.is_leaf else
+              "internal:[" + ",".join(str(x) for x in sorted(n.key)) + "]"
+              for key, n in nodes0.items()}
+    states0 = body0["states"]
+    for nr in anc["nodes"]:
+        key = next(kk for kk, lab in labels.items() if lab == nr["node_id"])
+        assert [states0[s] for s in sorted(ns_seen[key])] == \
+            nr["possible_states"], nr
+        assert nr["leaf_id"] == (key if nr["kind"] == "leaf" else None)
+        assert nr["edges"] == sorted(key) if nr["kind"] == "internal" else True
+    for er in anc["edges"]:
+        seen = ep_seen[er["edge_num"]]
+        assert sorted((states0[a], states0[b]) for a, b in seen) == \
+            sorted((a, b) for a, b in er["possible_pairs"]), er
+        if all(a == b for a, b in seen):
+            assert er["change"] == "always_same"
+        elif all(a != b for a, b in seen):
+            assert er["change"] == "always_change"
+        else:
+            assert er["change"] == "possibly_change"
+    print("ancestral brute-force cross-check OK: cost", bf_cost,
+          "histories", bf_ways)
+
+    # ambiguous leaves tied for the optimum must multiply the history count
+    leaves_amb = {leaf: ["sensitive", "tolerant"]
+                  for leaf in ("refA", "refB", "refC", "refD", "refE")}
+    bamb = anc_body(leaves=leaves_amb)
+    aamb = client.post("/ancestral/states", json=bamb).json()
+    bfamb = brute_force(bamb)
+    assert aamb["minimum_cost"] == bfamb[0] == 0
+    assert aamb["optimal_histories"] == str(bfamb[1])
+    assert bfamb[1] == 2
+    print("ambiguous-leaf histories OK:", aamb["optimal_histories"])
+
+    # rooting by another outgroup keeps the global optimum and its count
+    bodyA = anc_body(outgroup="refA")
+    rA = client.post("/ancestral/states", json=bodyA)
+    assert rA.status_code == 200, rA.text
+    ancA = rA.json()
+    bfA = brute_force(bodyA)
+    assert ancA["minimum_cost"] == bfA[0]
+    assert ancA["optimal_histories"] == str(bfA[1])
+    assert ancA["root_node"] != anc["root_node"]
+
+    # all-unknown leaf set with 3 states: all assignments cost 0
+    all3 = {leaf: ["sensitive", "tolerant", "resistant"]
+            for leaf in ("refA", "refB", "refC", "refD", "refE")}
+    m3 = [[0, 1, 2], [2, 0, 1], [1, 2, 0]]
+    b3 = anc_body(states=("sensitive", "tolerant", "resistant"),
+                  leaves=all3, matrix=m3)
+    a3 = client.post("/ancestral/states", json=b3).json()
+    bf3 = brute_force(b3)
+    assert a3["minimum_cost"] == bf3[0] == 0
+    assert a3["optimal_histories"] == str(bf3[1]) == "3"
+    assert all(nr["possible_states"] ==
+               ["sensitive", "tolerant", "resistant"] for nr in a3["nodes"])
+    assert all(er["change"] == "always_same" for er in a3["edges"])
+
+    # A genuinely infeasible direction pattern with diagonal fixed at 0:
+    # the x1/x2 cherry is (A, C), but no state can transition to *both*
+    # A and C (A->C, C->A, B->A and B->C are all forbidden), so that
+    # internal node has no legal state -- located by edge, no half output.
+    star_newick = ("((x1:0.1,x2:0.12):0.08,"
+                   "(x3:0.11,x4:0.09):0.07,x5:0.2);")
+    star_ref = "\n".join(">" + name + "\nACGTACGTACGTACGTACGT"
+                          for name in ("x1", "x2", "x3", "x4", "x5"))
+    star_q = ">q1\nACGTACGTACGTACGTACGT\n"
+    rstar = client.post("/place", json={
+        "reference_fasta": star_ref, "query_fasta": star_q,
+        "newick": star_newick})
+    assert rstar.status_code == 200, rstar.text
+    job_star = rstar.json()["job_id"]
+    from app.main import JOBS as _JOBS
+    JOBS_TREE[job_star] = _JOBS[job_star]["jplace"]["tree"]
+    mblock3 = [[0, 1, None], [None, 0, 1], [None, 1, 0]]
+    blocked = client.post("/ancestral/states", json=anc_body(
+        job=job_star, states=("A", "B", "C"), outgroup="x5",
+        leaves={"x1": ["A"], "x2": ["C"], "x3": ["A"], "x4": ["C"],
+                "x5": ["A"]},
+        matrix=mblock3)).json()
+    assert blocked["feasible"] is False
+    assert blocked["reasons"]
+    assert "minimum_cost" not in blocked and "nodes" not in blocked
+    print("infeasible history OK:", blocked["reasons"][0])
+
+    def anc_reject(body, fragment, raw=None):
+        r = client.post("/ancestral/states",
+                        content=raw, json=None if raw else body)
+        assert r.status_code == 422, r.text
+        problems = r.json()["detail"]["problems"]
+        assert any(fragment in p for p in problems), problems
+        print("ancestral rejected:", problems[0])
+
+    anc_reject(anc_body(job="nope"), "unknown job_id")
+    anc_reject(anc_body(outgroup="refX"), "not a leaf of the reference tree")
+    anc_reject(anc_body(states=("a", "a")), "duplicate state name")
+    anc_reject(anc_body(states=("a",)), "expected 2..5 states")
+    bl = dict(anc_body())
+    bl["leaf_states"] = {x: v for x, v in bl["leaf_states"].items()
+                         if x != "refE"}
+    anc_reject(bl, "missing entry for reference leaf 'refE'")
+    bl2 = dict(anc_body())
+    bl2["leaf_states"] = dict(bl2["leaf_states"])
+    bl2["leaf_states"]["refZ"] = ["sensitive"]
+    anc_reject(bl2, "'refZ' is not a leaf of the reference tree")
+    bl3 = dict(anc_body())
+    bl3["leaf_states"] = dict(bl3["leaf_states"])
+    bl3["leaf_states"]["refC"] = ["nope"]
+    anc_reject(bl3, "unknown state 'nope'")
+    bl4 = dict(anc_body())
+    bl4["leaf_states"] = dict(bl4["leaf_states"])
+    bl4["leaf_states"]["refA"] = []
+    anc_reject(bl4, "non-empty list")
+    bm = dict(anc_body())
+    bm["cost_matrix"] = [[0, 1]]
+    anc_reject(bm, "expected 2 rows")
+    bm2 = dict(anc_body())
+    bm2["cost_matrix"] = [[1, 1], [1, 0]]
+    anc_reject(bm2, "diagonal cost must be 0")
+    bm3 = dict(anc_body())
+    bm3["cost_matrix"] = [[0, -1], [1, 0]]
+    anc_reject(bm3, "non-negative integer")
+    bm4 = dict(anc_body())
+    bm4["cost_matrix"] = [[0, True], [1, 0]]
+    anc_reject(bm4, "non-negative integer")
+    raw_dup = ('{"job_id": "' + job_id + '", "states": ["sensitive", '
+               '"tolerant"], "outgroup_leaf_id": "refE", '
+               '"leaf_states": {"refA": ["sensitive"], "refA": ["tolerant"],'
+               ' "refB": ["sensitive"], "refC": ["tolerant"], '
+               '"refD": ["tolerant"], "refE": ["sensitive"]}, '
+               '"cost_matrix": [[0, 1], [1, 0]]}')
+    anc_reject(None, "duplicate leaf entry 'refA'", raw=raw_dup)
+
     print("SELFTEST PASSED")
 
 
