@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+from .ancestral import AncestralError, reconstruct
 from .jplacefmt import build_jplace
 from .likelihood import DirectedMessages, obs_vector
 from .placement import has_base_evidence, place_query
@@ -164,5 +165,26 @@ def community_permanova(payload: dict):
     try:
         return run_permanova(payload, JOBS)
     except CommunityError as exc:
+        raise HTTPException(status_code=422,
+                            detail={"rejected": True, "problem": str(exc)})
+
+
+@app.post("/ancestral/reconstruct", status_code=200)
+def ancestral_reconstruct(payload: dict):
+    """Ancestral state reconstruction on a stored job's reference tree.
+
+    Re-roots the reference tree at the internal node next to the outgroup
+    leaf (all leaves and original edge numbers preserved) and minimises the
+    total transition cost over all node assignments under the per-leaf
+    allowed-state sets.  Reports the minimum cost, the exact number of
+    globally optimal histories (decimal string), and the states / ordered
+    parent->child pairs realised by at least one global optimum.  Stored
+    jobs are only read, never modified or recomputed; any located problem
+    (unknown job/leaf/state, duplicates, illegal matrix) rejects the whole
+    request with HTTP 422.
+    """
+    try:
+        return reconstruct(payload, JOBS)
+    except AncestralError as exc:
         raise HTTPException(status_code=422,
                             detail={"rejected": True, "problem": str(exc)})

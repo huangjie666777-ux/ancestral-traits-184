@@ -82,6 +82,65 @@ p = (极端次数 + 1)/(置换数 + 1)，同请求同种子完全复现。总平
 自由度、`F`、`R2`、`p_value`、`method`（`exact`/`random`）、实际次数
 `permutations` 及合法分配总数 `n_assignments`。
 
+
+## 祖先性状重建（`POST /ancestral/reconstruct`）
+
+研究人员可沿谱系追溯耐受性等性状的变化。请求字段：
+
+- `job_id`：已完成的放置任务 ID（只读取其带枝号参考树，**不修改任务、
+  不重算放置**）。
+- `states`：2–5 个唯一、非空的性状状态名。
+- `leaf_states`：每个参考叶 ID → 非空允许状态集合。键必须与参考树的叶
+  **完整一一对应**；性状未知的叶用全部状态表示。集合表达**不确定**
+  （取其一），而非同时具有多态。
+- `outgroup`：外群叶 ID；树在**外群叶的相邻内部节点**处重新定根，
+  全部叶与原 jplace 枝号保留。
+- `transition_costs`：按 `states` 顺序排列的方阵；元素为非负整数或
+  `null`（`null` 禁止该方向转移），对角必须为 0，布尔值被拒绝。
+
+未知任务、未知叶、未知状态、重复项（状态名、叶内重复状态）以及非法矩阵
+都会被**定位**并**整单拒绝**（HTTP 422）。
+
+代价模型：每条有向枝按父状态 → 子状态计**一次**矩阵代价，不乘枝长，
+也不在一枝内串接中间状态。在叶约束下用 Sankoff 动态规划求整树总代价
+最小的节点赋值。
+
+成功响应（`feasible: true`）：
+
+- `min_cost`：最小总代价（整数）。
+- `optimal_histories`：全局最优**完整赋值**的总数，十进制字符串
+  （可超 64 位），未知叶的不同取值分别计数。
+- `nodes`：每节点 `node_id`（叶为 `leaf:<参考ID>`，内部节点为
+  `internal:<相邻枝号升序列表>`）、`adjacent_edges`、`is_root`、
+  `parent`/`parent_edge`（父子方向）、以及 `possible_states`——
+  在**任一**全局最优历史中出现过的状态。
+- `edges`：每枝 `edge_num`、`parent`/`child`、`possible_pairs`
+  （在任一全局最优中出现过的**有序**父子状态对，不是两端状态集合的
+  笛卡尔积），以及 `change`：`always_change`（必然变化）、
+  `may_change`（可能变化）、`never_change`（必然不变）。
+  歧义只以“可能”表达，不冒充概率。
+
+若叶约束与 `null` 禁转移组合使任何完整历史都不可行，返回
+`feasible: false` 与 `reason` 说明，不返回半套节点/枝结果。
+
+### 启动与演示
+
+```bash
+.venv/bin/uvicorn app.main:app --port 8000 &
+# 1) 先做一次放置，拿到 job_id
+curl -s -X POST localhost:8000/place -H 'Content-Type: application/json' \
+  --data-binary @<( .venv/bin/python -c '
+import json, pathlib
+ex = pathlib.Path("examples")
+print(json.dumps({
+  "reference_fasta": (ex/"reference.fasta").read_text(),
+  "query_fasta": (ex/"queries.fasta").read_text(),
+  "newick": (ex/"tree.nwk").read_text()}))' )
+# 2) 把返回的 job_id 填入 examples/ancestral.json 后请求祖先重建
+curl -s -X POST localhost:8000/ancestral/reconstruct \
+  -H 'Content-Type: application/json' --data-binary @examples/ancestral.json
+```
+
 ## 模块协作
 
 - `app/validation.py` — FASTA/Newick 解析与定位校验（整单拒绝）
@@ -91,8 +150,10 @@ p = (极端次数 + 1)/(置换数 + 1)，同请求同种子完全复现。总平
 - `app/jplacefmt.py` — jplace v3 文档组装（五个标准放置字段）
 - `app/community.py` — 样本校验、质量构造（全候选权重）与树上 KR(p=1) 距离
 - `app/permanova.py` — 批次约束的分组设计校验、平方和分解与精确/随机置换检验
+- `app/ancestral.py` — 外群定根、Sankoff 最小代价重建、最优历史计数与可能状态/枝对
 - `app/main.py` — FastAPI 入口：`POST /place`、`GET /place/{job_id}/jplace`、
-  `POST /community/distances`、`POST /community/permanova`
+  `POST /community/distances`、`POST /community/permanova`、
+  `POST /ancestral/reconstruct`
 
 ## 运行
 

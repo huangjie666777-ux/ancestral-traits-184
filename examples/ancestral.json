@@ -1,0 +1,13 @@
+{
+  "job_id": "<填入 /place 返回的 job_id>",
+  "states": ["tolerant", "sensitive"],
+  "leaf_states": {
+    "refA": ["tolerant"],
+    "refB": ["tolerant"],
+    "refC": ["sensitive"],
+    "refD": ["tolerant", "sensitive"],
+    "refE": ["sensitive"]
+  },
+  "outgroup": "refE",
+  "transition_costs": [[0, 2], [3, 0]]
+}

@@ -293,6 +293,163 @@ def main() -> None:
         {"sample_id": "w3", "job_id": job_id,
          "counts": {"q1": 2, "q2": 8}, "group": "C"}],
         "permutations": 99, "seed": 1}, "within-group sum of squares is zero")
+
+    # ---- ancestral state reconstruction on the stored job ----
+    from app.ancestral import _build_nodes, _reroot
+    import itertools
+
+    anc = {
+        "job_id": job_id,
+        "states": ["tolerant", "sensitive"],
+        "leaf_states": {
+            "refA": ["tolerant"],
+            "refB": ["tolerant"],
+            "refrefC": ["sensitive"],
+            "refD": ["tolerant", "sensitive"],
+            "refE": ["sensitive"],
+        },
+        "outgroup": "refE",
+        "transition_costs": [[0, 2], [3, 0]],
+    }
+    anc["leaf_states"] = {
+        "refA": ["tolerant"], "refB": ["tolerant"], "refC": ["sensitive"],
+        "refD": ["tolerant", "sensitive"], "refE": ["sensitive"]}
+    resp = client.post("/ancestral/reconstruct", json=anc)
+    assert resp.status_code == 200, resp.text
+    ar = resp.json()
+    assert ar["feasible"] is True
+    assert isinstance(ar["optimal_histories"], str)
+    assert ar["min_cost"] >= 0
+
+    # brute-force cross-check over every complete assignment
+    geo_a = parse_annotated_newick(tree_text)
+    nodes_a = _build_nodes(geo_a)
+    root_a, children_a, parent_edge_a, endpoints_a = _reroot(nodes_a, "refE")
+    n_nodes = len(nodes_a)
+    allowed_idx = []
+    for nd in nodes_a:
+        if nd["leaf"] is None:
+            allowed_idx.append([0, 1])
+        else:
+            allowed_idx.append([ar["states"].index(s)
+                                for s in anc["leaf_states"][nd["leaf"]]])
+    mat = anc["transition_costs"]
+    best_cost = None
+    best_assigns = []
+    for combo in itertools.product(*allowed_idx):
+        total = 0
+        ok = True
+        for e, (u, v) in endpoints_a.items():
+            w = mat[combo[u]][combo[v]]
+            if w is None:
+                ok = False
+                break
+            total += w
+        if not ok:
+            continue
+        if best_cost is None or total < best_cost:
+            best_cost, best_assigns = total, [combo]
+        elif total == best_cost:
+            best_assigns.append(combo)
+    assert ar["min_cost"] == best_cost, (ar["min_cost"], best_cost)
+    assert int(ar["optimal_histories"]) == len(best_assigns), (
+        ar["optimal_histories"], len(best_assigns))
+    node_by_id = {}
+    for i, nd in enumerate(nodes_a):
+        nid = ("leaf:" + nd["leaf"] if nd["leaf"] is not None
+               else "internal:" + ",".join(str(e) for e in nd["edges"]))
+        node_by_id[nid] = i
+    for rep in ar["nodes"]:
+        i = node_by_id[rep["node_id"]]
+        expect = sorted({ar["states"][c[i]] for c in best_assigns},
+                        key=ar["states"].index)
+        assert rep["possible_states"] == expect, (rep, expect)
+    for rep in ar["edges"]:
+        u, v = endpoints_a[rep["edge_num"]]
+        expect = sorted({(ar["states"][c[u]], ar["states"][c[v]])
+                         for c in best_assigns})
+        got = sorted(tuple(p) for p in rep["possible_pairs"])
+        assert got == expect, (rep, expect)
+        kinds = {a != b for a, b in expect}
+        want = ("always_change" if kinds == {True} else
+                "never_change" if kinds == {False} else "may_change")
+        assert rep["change"] == want, (rep, want)
+    root_entries = [n for n in ar["nodes"] if n["is_root"]]
+    assert len(root_entries) == 1
+    assert root_entries[0]["parent"] is None
+    assert root_entries[0]["parent_edge"] is None
+    assert ar["root"] == root_entries[0]["node_id"]
+    assert all(n["parent"] is not None for n in ar["nodes"]
+               if not n["is_root"])
+    leaf_entries = [n for n in ar["nodes"] if n["kind"] == "leaf"]
+    assert sorted(n["leaf_id"] for n in leaf_entries) == \
+        ["refA", "refB", "refC", "refD", "refE"]
+    assert sorted(e["edge_num"] for e in ar["edges"]) == list(range(7))
+    print("ancestral:", ar["min_cost"], "cost,",
+          ar["optimal_histories"], "optimal histories, root", ar["root"])
+
+    # unknown trait (all states) inflates the count of optimal histories
+    anc_unknown = dict(anc, leaf_states={
+        "refA": ["tolerant"], "refB": ["tolerant"], "refC": ["sensitive"],
+        "refD": ["tolerant", "sensitive"],
+        "refE": ["tolerant", "sensitive"]})
+    resp = client.post("/ancestral/reconstruct", json=anc_unknown)
+    assert resp.status_code == 200, resp.text
+    au = resp.json()
+    assert au["min_cost"] <= ar["min_cost"] + 3
+    assert int(au["optimal_histories"]) >= 1
+    print("ancestral with unknown outgroup trait:", au["optimal_histories"])
+
+    # forbidden transition can make every history infeasible
+    anc_null = dict(anc, transition_costs=[[0, None], [None, 0]])
+    resp = client.post("/ancestral/reconstruct", json=anc_null)
+    assert resp.status_code == 200, resp.text
+    inf = resp.json()
+    assert inf["feasible"] is False
+    assert "no feasible history" in inf["reason"]
+    assert "nodes" not in inf and "edges" not in inf
+    print("infeasible reason:", inf["reason"])
+
+    def anc_reject(body, fragment):
+        r = client.post("/ancestral/reconstruct", json=body)
+        assert r.status_code == 422, r.text
+        assert fragment in r.json()["detail"]["problem"], r.text
+        print("ancestral rejected:", r.json()["detail"]["problem"])
+
+    anc_reject(dict(anc, job_id="nope"), "unknown job_id")
+    anc_reject(dict(anc, states=["tolerant"]), "2..5 states")
+    anc_reject(dict(anc, states=["a", "a"]), "duplicate state name")
+    anc_reject(dict(anc, leaf_states={k: v for k, v in
+                                      anc["leaf_states"].items()
+                                      if k != "refB"}),
+               "leaf 'refB' has no allowed-state set")
+    bad_leaf = dict(anc["leaf_states"], refZ=["tolerant"])
+    anc_reject(dict(anc, leaf_states=bad_leaf), "unknown leaf 'refZ'")
+    bad_state = dict(anc["leaf_states"], refA=["tolerant", "weird"])
+    anc_reject(dict(anc, leaf_states=bad_state), "unknown state 'weird'")
+    dup_state = dict(anc["leaf_states"],
+                     refA=["tolerant", "tolerant"])
+    anc_reject(dict(anc, leaf_states=dup_state), "duplicate state 'tolerant'")
+    empty_set = dict(anc["leaf_states"], refA=[])
+    anc_reject(dict(anc, leaf_states=empty_set), "non-empty list")
+    anc_reject(dict(anc, outgroup="refZ"), "unknown outgroup leaf 'refZ'")
+    anc_reject(dict(anc, transition_costs=[[0, 1], [1]]), "list of 2 entries")
+    anc_reject(dict(anc, transition_costs=[[0, 1], [1, 1]]),
+               "the diagonal must be 0")
+    anc_reject(dict(anc, transition_costs=[[0, True], [1, 0]]),
+               "booleans are not allowed")
+    anc_reject(dict(anc, transition_costs=[[0, 1.5], [1, 0]]),
+               "non-negative integer or null")
+    anc_reject(dict(anc, transition_costs=[[0, -1], [1, 0]]),
+               "non-negative integer or null")
+    anc_reject(dict(anc, transition_costs=[[None, 1], [1, 0]]),
+               "the diagonal must be 0, not null")
+
+    # stored job must remain untouched by reconstruction
+    dl2 = client.get("/place/" + job_id + "/jplace")
+    assert dl2.status_code == 200
+    assert json.loads(dl2.content) == doc
+
     print("SELFTEST PASSED")
 
 
